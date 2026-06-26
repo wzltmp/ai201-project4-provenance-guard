@@ -138,7 +138,13 @@ ways agree, we can be confident; when they disagree, that disagreement drives th
                   "ai_vocab_hits": 3, "mean_sentence_len": 19.4, "word_count": 220 } }
   ```
   `p_ai` is a float in [0,1], computed as a weighted sum of the per-feature sub-scores (each
-  feature normalized to a 0–1 "AI-ness" contribution), then clamped.
+  feature normalized to a 0–1 "AI-ness" contribution), then clamped. **Implemented weights
+  (M4, `signals/stylometry.py`):** burstiness 0.35, transition-density 0.25, AI-vocab 0.25,
+  lexical-diversity 0.15 — burstiness is the most robust discriminator, so it leads; lexical
+  diversity is length-sensitive and noisy, so it trails. Each sub-score interpolates linearly
+  between an "AI-end" and "human-end" cutoff (e.g. burstiness ≤ 0.25 → fully AI-like, ≥ 0.75 →
+  fully human-like). Cutoffs/weights were calibrated against the §2 mini-corpus in
+  `scripts/try_scoring.py`.
 - **Blind spot:** genre-dependent and trivially gamed — formal/technical human writing looks
   "AI-like," poetry/lyrics break the prose assumptions entirely, very short texts lack stable
   statistics, and a user can defeat it by varying sentence length or adding typos.
@@ -183,6 +189,15 @@ two situations that should *not* read as confident:
 Calibration itself happens in **M4**: I run a labeled mini-corpus, bucket decisions by
 `confidence`, and adjust the weights (0.6/0.4), the 0.70 threshold, and the penalty strengths
 until each confidence bucket's *observed accuracy* roughly matches its *stated* confidence.
+
+**M4 calibration result (`scripts/try_scoring.py`):** the first run collapsed *every* sample to
+*Uncertain* — the LLM judge clustered clear cases at ~0.8/0.2 instead of the extremes, and since
+`raw = 2·|p_ai−0.5|`, a fused `p_ai ≈ 0.82` caps certainty at ~0.64, under the 0.70 bar. Fix that
+held the **0.70 threshold fixed** (kept the symmetric bar as specced): the LLM prompt now instructs
+full-range calibration (≥0.9 / ≤0.1 when evidence is clear, ~0.5 only when genuinely ambiguous).
+After this, clear AI → conf ≈ 0.78 (*ai*), clear casual human → ≈ 0.77 (*human*), while a formal-
+human passage and a lightly-edited-AI passage both fall to *Uncertain* (≈ 0.16 / 0.24) — the bands
+now separate as intended.
 
 **Thresholds — what separates the three outcomes.** The decision variable is `confidence`,
 with `p_ai` choosing the side:

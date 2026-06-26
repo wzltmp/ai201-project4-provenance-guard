@@ -31,8 +31,11 @@ _SYSTEM_PROMPT = (
     "idiomatic risk-taking, and concrete personal detail. AI prose tends to be fluent but "
     "generic, evenly hedged, and structurally balanced; human prose takes more idiosyncratic "
     "risks and varies in quality. Be calibrated and cautious: polished or formal writing is NOT "
-    "by itself evidence of AI, and non-native-English writing is often human. When genuinely "
-    "unsure, return a probability near 0.5 rather than a confident guess.\n\n"
+    "by itself evidence of AI, and non-native-English writing is often human.\n\n"
+    "Calibrate across the FULL 0-1 range: when the evidence clearly points one way, commit to a "
+    "value near the extreme (>= 0.9 for text that is obviously AI-generated, <= 0.1 for text that "
+    "is obviously human); reserve values near 0.5 for genuinely ambiguous cases. Do not cluster "
+    "around 0.7-0.8 when you are actually confident.\n\n"
     'Respond with ONLY a JSON object of exactly this shape: '
     '{"p_ai": <number between 0 and 1>, "rationale": "<one short sentence>"}. '
     "p_ai is the probability the text is AI-generated (1 = certainly AI, 0 = certainly human)."
