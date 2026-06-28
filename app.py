@@ -1,7 +1,7 @@
-"""Provenance Guard — Flask API (Milestone 5, production layer).
+"""Provenance Guard — Flask API.
 
 Endpoints:
-  POST /submit    classify text with BOTH signals, fuse → confidence + verdict + label,
+  POST /submit    classify text with ALL signals, fuse → confidence + verdict + label,
                   write an audit row  (rate-limited)
   POST /appeal    contest a classification: log the creator's reasoning, flip status →
                   under_review (no automatic re-classification)
@@ -26,8 +26,10 @@ load_dotenv()  # pull GROQ_API_KEY from .env before any signal import needs it
 from labels import render_label  # noqa: E402
 from scoring import fuse  # noqa: E402
 from signals.llm import score_llm  # noqa: E402
+from signals.readability import score_readability  # noqa: E402
 from signals.stylometry import score_stylometry  # noqa: E402
 from store import (  # noqa: E402
+    analytics_summary,
     get_appeals,
     get_decision,
     init_db,
@@ -67,13 +69,14 @@ def submit():
     creator_id = body.get("creator_id") or body.get("author_id")
     content_type = body.get("content_type")
 
-    # Run both signals. Each is independent and never raises (failures degrade to p_ai≈0.5).
+    # Run all three signals. Each is independent and never raises (failures → p_ai≈0.5).
     llm = score_llm(text)                    # Signal 1 — holistic LLM judge
     stylo = score_stylometry(text)           # Signal 2 — mechanical stylometry
+    read = score_readability(text)           # Signal 3 — n-gram predictability + Fog index
     word_count = stylo["features"]["word_count"]
 
     # Fuse → calibrated confidence + 3-way verdict (ai | human | uncertain). See scoring.py.
-    fused = fuse(llm["p_ai"], stylo["p_ai"], word_count)
+    fused = fuse(llm["p_ai"], stylo["p_ai"], word_count, read["p_ai"])
     verdict = fused["verdict"]
     label = render_label(verdict, fused["confidence"])
 
@@ -94,6 +97,8 @@ def submit():
             "llm_rationale": llm["rationale"],
             "stylo_p_ai": stylo["p_ai"],
             "stylo_features": json.dumps(stylo["features"]),
+            "read_p_ai": read["p_ai"],
+            "read_features": json.dumps(read["features"]),
             "label_variant": label["variant"],
             "label_text": label["text"],
             "status": "classified",
@@ -110,6 +115,7 @@ def submit():
             "signals": {
                 "llm": {"p_ai": llm["p_ai"], "rationale": llm["rationale"]},
                 "stylometric": {"p_ai": stylo["p_ai"], "features": stylo["features"]},
+                "readability": {"p_ai": read["p_ai"], "features": read["features"]},
             },
             "label": label,
             "status": "classified",
@@ -175,6 +181,12 @@ def log():
 def appeals():
     """Reviewer queue. ``?status=under_review`` filters to open appeals (default: all appealed)."""
     return jsonify({"appeals": get_appeals(request.args.get("status"))})
+
+
+@app.get("/analytics")
+def analytics():
+    """Aggregated detection statistics: verdict distribution, appeal rate, signal disagreement."""
+    return jsonify(analytics_summary())
 
 
 @app.get("/health")

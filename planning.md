@@ -1,5 +1,66 @@
 # Provenance Guard — Planning & Spec
 
+---
+
+## Stretch Feature A — Ensemble Detection (Signal 3: Readability)
+
+**Goal:** Add a third pure-Python detection signal orthogonal to both existing ones. Signal 1
+(LLM) captures holistic semantics; Signal 2 (stylometry) captures sentence-level variance,
+transitions, and known AI vocabulary. Signal 3 (readability) captures **n-gram predictability,
+structural formatting density, and prose complexity** — patterns neither of the other signals
+measure.
+
+### Signal 3: Readability heuristics (`signals/readability.py`)
+
+`score_readability(text: str) -> dict` — never raises; falls back to `p_ai=0.5` on any error.
+
+Sub-scores (weighted sum, weights sum to 1.0):
+
+| Sub-score | Weight | AI indicator | Threshold |
+|---|---|---|---|
+| `pronoun_absence` | 0.40 | `1 - pronoun_density` (inverted). AI avoids first/second-person voice. | ≤0.5% pronouns → fully AI; ≥5% → fully human |
+| `punct_monotony` | 0.35 | `1 - punct_variety`. AI ends nearly all sentences with periods. | 0 variety → 1.0 AI; rising variety → lower |
+| `bigram_repeat_rate` | 0.25 | `1 - unique_bigrams/total_bigrams`. More repetitive = AI-like. | Meaningful on longer text; 0 on short texts (neutral) |
+
+Return shape:
+```json
+{"signal": "readability", "p_ai": 0.75,
+ "features": {"bigram_repeat_rate": 0.0, "punct_variety": 0.0,
+               "pronoun_density": 0.0, "word_count": 65}}
+```
+
+**Calibration note:** A Fog-index [8,12] comfort-zone approach was tested and rejected —
+corpus samples (both AI and human) scored Fog 22–32, so the zone provided no discrimination.
+Personal pronoun absence proved far more robust: AI text is consistently impersonal; casual
+human text is pronoun-rich; formal human text is borderline (acceptable).
+
+### Updated fusion (`scoring.py`)
+
+`fuse(p_llm, p_stylo, word_count, p_read=None)`
+
+| Path | Condition | Weights | Disagreement |
+|---|---|---|---|
+| 3-signal (prose) | `p_read is not None` | LLM 0.50 · Stylo 0.30 · Read 0.20 | mean of 3 pairwise \|pi−pj\| |
+| 2-signal (metadata / fallback) | `p_read is None` | LLM 0.60 · other 0.40 | \|p_llm − p_stylo\| |
+
+Remove the old top-level `WEIGHT_LLM = 0.6` constant; inline weights inside each branch.
+
+### DB changes (`store.py`)
+
+New columns on `decisions`: `read_p_ai REAL`, `read_features TEXT` (JSON).
+Added to `_DECISION_COLUMNS`, `init_db()` migration loop, `_decision_entry()` (conditional on
+`row["read_p_ai"] is not None`), and `get_appeals()` signals block.
+
+### API impact
+
+`POST /submit` response `signals` block gains:
+```json
+"readability": {"p_ai": 0.74, "features": {"bigram_repeat_rate": 0.31, ...}}
+```
+`GET /log` and `GET /appeals` expose the same block per entry.
+
+---
+
 This is the implementation-ready specification for Provenance Guard. It is written **before**
 the application code and is the primary reference fed to AI tools during Milestones 3–5. The
 verbatim transparency-label text and the final rate-limit numbers are mirrored in the `README`;
@@ -8,6 +69,40 @@ this file is where the *reasoning* and *contracts* live.
 Document map: **Architecture** · **(1) Detection Signals** · **(2) Uncertainty
 Representation** · **(3) Transparency Label Design** · **(4) Appeals Workflow** ·
 **(5) Edge Cases** · **API Surface** · **AI Tool Plan** · **Traceability**.
+
+---
+
+## Stretch Feature D — Analytics Dashboard
+
+**Goal:** A single `GET /analytics` endpoint returning aggregated detection intelligence with no
+schema changes — all metrics are derived from existing columns via SQL aggregates.
+
+### Metrics returned
+
+**Detection patterns:**
+- `total_decisions`: total rows in `decisions`
+- `verdict_distribution`: per-verdict `{count, pct, mean_confidence}` for `ai`, `human`, `uncertain`
+- `by_content_type`: count of decisions per `content_type` value
+
+**Appeal rate:**
+- `total_appeals`: total rows in `appeals`
+- `rate`: `total_appeals / total_decisions` (float, 0 if no decisions)
+- `open_appeals`: count of decisions with `status = 'under_review'`
+- `mean_p_ai_appealed`: average `p_ai` of appealed decisions (NULL-safe; null when no appeals)
+
+**Signal disagreement rate** (custom metric):
+- `discord_rate`: fraction of prose decisions where `|llm_p_ai − stylo_p_ai| > 0.3`
+- SQLite NULL propagation automatically excludes metadata decisions (where `stylo_p_ai IS NULL`)
+- Denominator: `COUNT(*) WHERE stylo_p_ai IS NOT NULL` (prose-only)
+- `discord_threshold`: 0.3 (documented for transparency)
+
+### Implementation
+
+`store.py`: new `analytics_summary() -> dict`. Single connection, multiple `fetchone`/`fetchall`
+queries. Guard all divisions: `if total else 0`. Guard `mean_p_ai_appealed` SQL NULL with
+`round(x, 3) if x is not None else None`.
+
+`app.py`: `@app.get("/analytics")` route — no rate limiting.
 
 ---
 

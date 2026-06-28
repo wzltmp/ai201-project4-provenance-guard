@@ -35,6 +35,8 @@ _DECISION_COLUMNS = (
     "llm_rationale",
     "stylo_p_ai",
     "stylo_features",
+    "read_p_ai",
+    "read_features",
     "label_variant",
     "label_text",
     "status",
@@ -54,6 +56,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     llm_rationale  TEXT,
     stylo_p_ai     REAL,
     stylo_features TEXT,
+    read_p_ai      REAL,
+    read_features  TEXT,
     label_variant  TEXT,
     label_text     TEXT,
     status         TEXT NOT NULL
@@ -102,7 +106,12 @@ def init_db() -> None:
         conn.executescript(_SCHEMA)
         # Idempotent migration: upgrade a pre-M4 db (without the stylometry columns) in place.
         existing = {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}
-        for col, decl in (("stylo_p_ai", "REAL"), ("stylo_features", "TEXT")):
+        for col, decl in (
+            ("stylo_p_ai", "REAL"),
+            ("stylo_features", "TEXT"),
+            ("read_p_ai", "REAL"),
+            ("read_features", "TEXT"),
+        ):
             if col not in existing:
                 conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {decl}")
 
@@ -168,6 +177,22 @@ def _appeals_by_content() -> dict[str, dict[str, Any]]:
 def _decision_entry(row: sqlite3.Row, appeals: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Shape one decision row into the /log entry, attaching its appeal if one exists."""
     appeal = appeals.get(row["content_id"])
+    signals: dict[str, Any] = {
+        "llm": {
+            "p_ai": row["llm_p_ai"],
+            "rationale": row["llm_rationale"],
+        },
+    }
+    if row["stylo_p_ai"] is not None:
+        signals["stylometric"] = {
+            "p_ai": row["stylo_p_ai"],
+            "features": _load_json(row["stylo_features"]),
+        }
+    if row["read_p_ai"] is not None:
+        signals["readability"] = {
+            "p_ai": row["read_p_ai"],
+            "features": _load_json(row["read_features"]),
+        }
     return {
         "content_id": row["content_id"],
         "creator_id": row["creator_id"],
@@ -176,16 +201,7 @@ def _decision_entry(row: sqlite3.Row, appeals: dict[str, dict[str, Any]]) -> dic
         "attribution": row["attribution"],
         "p_ai": row["p_ai"],
         "confidence": row["confidence"],
-        "signals": {
-            "llm": {
-                "p_ai": row["llm_p_ai"],
-                "rationale": row["llm_rationale"],
-            },
-            "stylometric": {
-                "p_ai": row["stylo_p_ai"],
-                "features": _load_json(row["stylo_features"]),
-            },
-        },
+        "signals": signals,
         "label": {
             "variant": row["label_variant"],
             "text": row["label_text"],
@@ -210,6 +226,72 @@ def recent_decisions(limit: int = 20) -> list[dict[str, Any]]:
             (limit,),
         ).fetchall()
     return [_decision_entry(row, appeals) for row in rows]
+
+
+def analytics_summary() -> dict[str, Any]:
+    """Return aggregated detection statistics for ``GET /analytics``.
+
+    Three sections: detection patterns, appeal rate, and signal disagreement rate.
+    All divisions guard against an empty database (total == 0 / prose_count == 0).
+    """
+    with _connect() as conn:
+        total: int = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+        verdict_rows = conn.execute(
+            "SELECT attribution, COUNT(*), AVG(confidence) FROM decisions GROUP BY attribution"
+        ).fetchall()
+        type_rows = conn.execute(
+            "SELECT content_type, COUNT(*) FROM decisions GROUP BY content_type"
+        ).fetchall()
+        total_appeals: int = conn.execute("SELECT COUNT(*) FROM appeals").fetchone()[0]
+        open_appeals: int = conn.execute(
+            "SELECT COUNT(*) FROM decisions WHERE status = 'under_review'"
+        ).fetchone()[0]
+        mean_p_ai_row = conn.execute(
+            "SELECT AVG(d.p_ai) FROM appeals a JOIN decisions d ON a.content_id = d.content_id"
+        ).fetchone()
+        discord_count: int = conn.execute(
+            "SELECT COUNT(*) FROM decisions WHERE ABS(llm_p_ai - stylo_p_ai) > 0.3"
+        ).fetchone()[0]
+        prose_count: int = conn.execute(
+            "SELECT COUNT(*) FROM decisions WHERE stylo_p_ai IS NOT NULL"
+        ).fetchone()[0]
+
+    mean_p_ai_appealed = mean_p_ai_row[0]
+
+    verdict_dist: dict[str, Any] = {}
+    for attribution, count, mean_conf in verdict_rows:
+        verdict_dist[attribution] = {
+            "count": count,
+            "pct": round(count / total * 100, 1) if total else 0.0,
+            "mean_confidence": round(mean_conf, 3) if mean_conf is not None else None,
+        }
+
+    return {
+        "detection_patterns": {
+            "total_decisions": total,
+            "verdict_distribution": verdict_dist,
+            "by_content_type": {
+                (ct or "unspecified"): cnt for ct, cnt in type_rows
+            },
+        },
+        "appeal_rate": {
+            "total_appeals": total_appeals,
+            "rate": round(total_appeals / total, 4) if total else 0,
+            "open_appeals": open_appeals,
+            "mean_p_ai_appealed": (
+                round(mean_p_ai_appealed, 3) if mean_p_ai_appealed is not None else None
+            ),
+        },
+        "signal_disagreement": {
+            "discord_rate": round(discord_count / prose_count, 4) if prose_count else 0,
+            "discord_threshold": 0.3,
+            "note": (
+                "Fraction of prose decisions where |llm_p_ai - stylo_p_ai| > 0.3. "
+                "High discord means the two signals fundamentally disagree — those decisions "
+                "resolve to uncertain rather than a definitive label."
+            ),
+        },
+    }
 
 
 def get_appeals(status: str | None = None) -> list[dict[str, Any]]:
@@ -245,10 +327,8 @@ def get_appeals(status: str | None = None) -> list[dict[str, Any]]:
                     "decided_at": row["timestamp"],
                     "signals": {
                         "llm": {"p_ai": row["llm_p_ai"], "rationale": row["llm_rationale"]},
-                        "stylometric": {
-                            "p_ai": row["stylo_p_ai"],
-                            "features": _load_json(row["stylo_features"]),
-                        },
+                        **({"stylometric": {"p_ai": row["stylo_p_ai"], "features": _load_json(row["stylo_features"])}} if row["stylo_p_ai"] is not None else {}),
+                        **({"readability": {"p_ai": row["read_p_ai"], "features": _load_json(row["read_features"])}} if row["read_p_ai"] is not None else {}),
                     },
                 },
                 "content_excerpt": (row["content"] or "")[:200],

@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
 
 from scoring import fuse  # noqa: E402
+from signals.readability import score_readability  # noqa: E402
 from signals.stylometry import score_stylometry  # noqa: E402
 
 # (label, expected-direction, text)
@@ -83,16 +84,17 @@ def pass2_full_fusion() -> None:
     from signals.llm import score_llm
 
     print("\n" + "=" * 78)
-    print("PASS 2 — FULL FUSION (LLM + stylometry → confidence + verdict).")
+    print("PASS 2 — FULL FUSION (LLM + stylometry + readability → confidence + verdict).")
     print("=" * 78)
-    print(f"\n{'case':28s} {'p_llm':>6} {'p_stylo':>8} {'p_ai':>6} {'conf':>6}  verdict")
-    print("-" * 70)
+    print(f"\n{'case':28s} {'p_llm':>6} {'p_stylo':>8} {'p_read':>7} {'p_ai':>6} {'conf':>6}  verdict")
+    print("-" * 78)
     for label, _, text in CASES:
         llm = score_llm(text)
         stylo = score_stylometry(text)
-        fused = fuse(llm["p_ai"], stylo["p_ai"], stylo["features"]["word_count"])
+        read = score_readability(text)
+        fused = fuse(llm["p_ai"], stylo["p_ai"], stylo["features"]["word_count"], read["p_ai"])
         print(
-            f"{label:28s} {llm['p_ai']:>6.2f} {stylo['p_ai']:>8.2f} "
+            f"{label:28s} {llm['p_ai']:>6.2f} {stylo['p_ai']:>8.2f} {read['p_ai']:>7.2f} "
             f"{fused['p_ai']:>6.2f} {fused['confidence']:>6.2f}  {fused['verdict']}"
         )
 
