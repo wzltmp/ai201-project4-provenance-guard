@@ -20,3 +20,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Local demo scripts — not for repo
+DEMO_SCRIPT.md
+WALKTHROUGH.md
